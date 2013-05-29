@@ -3,6 +3,41 @@ import numpy as np
 import sklearn.metrics
 import sklearn.svm
 
+def create_bags_from_instance_ids(instance_samples, instance_targets, instance_bag_ids):
+	'''
+	This utility function will create well-formed bags using bag IDs associated
+	with every instance.
+
+	Parameters
+	----------
+	instance_samples : array-like, shape = [n_samples, n_features]
+
+	instance_targets : array-like, shape = [n_samples]
+
+	instance_bag_ids : array-like, shape = [n_samples], items = ( integer )
+
+	Returns
+	-------
+	bag_samples : array, shape = [n_bags], items = ( array-like, shape = [bag_n_samples, n_features] )
+
+	bag_targets : array, shape = [n_bags], items = ( array-like, shape = [bag_n_samples, n_features] )
+
+	bag_instance_targets : array, shape = [n_bags], items = ( array-like, shape = [bag_n_samples] )
+
+	'''
+	num_of_instances = len(instance_samples)
+	bag_samples = []
+	bag_targets = []
+	bag_instance_targets = []
+	for bag_id in np.unique(instance_bag_ids):
+		this_bag_instance_indices = filter(lambda instance_index: instance_bag_ids[instance_index] == bag_id, range(0, num_of_instances))
+		this_bag_instances = [instance_samples[i] for i in this_bag_instance_indices]
+		this_bag_instance_targets = [instance_targets[i] for i in this_bag_instance_indices]
+		bag_samples.append(this_bag_instances)
+		bag_instance_targets.append(this_bag_instance_targets)
+		bag_targets.append(1 if np.max(this_bag_instance_targets) == 1 else -1)
+	return bag_samples, bag_targets, bag_instance_targets
+
 class MultipleInstanceSVC():
 	'''
 	An implementation of miSVM [1] built on top of Scikit-Learn's SVM
@@ -45,7 +80,7 @@ class MultipleInstanceSVC():
 		self.svc = None
 		self.num_of_fit_iterations_ = 0
 
-	def fit(self, X, y, max_iterations=100, **kwargs):
+	def fit(self, X, y, max_iterations=100, K=None, per_iter_func=None, **kwargs):
 		'''
 		Fit the miSVM model according to the given bag-level training data.
 
@@ -60,9 +95,16 @@ class MultipleInstanceSVC():
         y : array-like, shape = [n_bags]
             Target bag-level binary (+1/-1) class labels.
 
-        max_iterations : integer, default = 100
+        max_iterations : integer, optional (default=100)
             The maximum number of iterations to perform for instance-level
             label imputing.
+
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
 
         sample_weight : array-like, shape = [n_samples], optional
             Weights applied to individual samples (1. for unweighted).
@@ -79,6 +121,7 @@ class MultipleInstanceSVC():
 		'''
 		bag_level_samples = X
 		bag_level_targets = y
+		kernel = K
 
 		# initialize containers to hold instance level samples for SVC
 		instance_level_samples = []
@@ -108,11 +151,23 @@ class MultipleInstanceSVC():
 		self.svc = None
 		self.num_of_fit_iterations_ = 0
 
+		if not kernel == None:
+			subset_kernel = kernel[instance_level_samples, :][:, instance_level_samples]
+
 		while True:
+			if not per_iter_func == None:
+				per_iter_func(self.num_of_fit_iterations_, iteration_instance_level_targets)
+
 			self.svc = sklearn.svm.SVC(**self.svc_parameters)
-			self.svc.fit(instance_level_samples, iteration_instance_level_targets, **kwargs)
-			instance_level_labels = self.svc.predict(instance_level_samples)
-			instance_level_probabilities = self.svc.predict_proba(instance_level_samples)
+			if kernel == None:
+				self.svc.fit(instance_level_samples, iteration_instance_level_targets, **kwargs)
+				instance_level_labels = self.svc.predict(instance_level_samples)
+				instance_level_probabilities = self.svc.predict_proba(instance_level_samples)
+			else:
+				self.precomputed_kernel_training_indices_ = instance_level_samples
+				self.svc.fit(subset_kernel, iteration_instance_level_targets, **kwargs)
+				instance_level_labels = self.svc.predict(subset_kernel)
+				instance_level_probabilities = self.svc.predict_proba(subset_kernel)
 		
 			# perform bag-level clean up on predicted labels
 			for bag_index, bag_instance_indices in enumerate(bag_instance_index_lists):
@@ -141,7 +196,7 @@ class MultipleInstanceSVC():
 
 		return self
 
-	def predict_in_bag(self, X):
+	def predict_in_bag(self, X, K=None):
 		'''
 		Returns the instance-level predicted label per bag on the given test
 		bag-level data. 
@@ -155,6 +210,13 @@ class MultipleInstanceSVC():
         X : array, shape = [n_bags], items = ( array-like, shape = [n_samples, n_features] )
             Bag-level test set.
 
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
+
         Returns
         -------
         y_pred : array, shape = [n_bags], items = ( array-like, shape = [n_samples] )
@@ -164,11 +226,15 @@ class MultipleInstanceSVC():
 		bag_level_labels = []
 		for bag_level_sample in bag_level_samples:
 			bags_instance_level_samples = bag_level_sample
-			bags_instance_level_labels = self.svc.predict(bags_instance_level_samples)
+			if K == None:
+				bags_instance_level_labels = self.svc.predict(bags_instance_level_samples)
+			else:
+				subset_kernel = K[bags_instance_level_samples, :][:, self.precomputed_kernel_training_indices_]
+				bags_instance_level_labels = self.svc.predict(subset_kernel)
 			bag_level_labels.append(bags_instance_level_labels)
 		return bag_level_labels
 
-	def predict(self, X):
+	def predict(self, X, K=None):
 		'''
 		Perform classification on bag-level samples in X.
 		
@@ -178,34 +244,121 @@ class MultipleInstanceSVC():
 		----------
         X : array, shape = [n_bags], items = ( array-like, shape = [n_samples, n_features] )
             Bag-level test set.
+
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
 		
 		Returns
 		-------
 		y_pred : array, shape = [n_bags]
 		'''
-		bag_level_labels = self.predict_in_bag(X)
-		return [max(bags_instance_level_labels) for bags_instance_level_labels in bag_level_labels]
+		assert(not self.svc == None)
+		bag_instance_labels = self.predict_in_bags(X, K=K)
+		return [max(bags_instance_level_labels) for bags_instance_level_labels in bag_instance_labels]
 
-	def predict_instances(self, X):
+	def predict_instances(self, X, K=None):
 		'''
 		Perform classification on instance-level samples in X.
 		
 		An array of predicted +1 or -1 instance-level labels is returned.
 
-		Just a pass-through to the trained SVC's `predict` method.
+		Just a pass-through to the trained SVC's `predict` method unless a K is
+		specified.
 		
 		Parameters
 		----------
         X : array-like, shape = [n_samples, n_features]
             Instance-level test set.
+
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
 		
 		Returns
 		-------
 		y_pred : array, shape = [n_samples]
 		'''
-		return self.svc.predict(X)
+		assert(not self.svc == None)
+		if K == None:
+			return self.svc.predict(X)
+		else:
+			subset_kernel = K[X, :][:, self.precomputed_kernel_training_indices_]
+			return self.svc.predict(subset_kernel)
 
-	def score_in_bag(self, X, y):
+	def predict_proba_in_bag(self, X, K=None):
+		'''
+		Returns the instance-level predicted class probabilities per bag on the
+		given test bag-level data. 
+		
+		Performs instance-level prediction (see `predict_proba_instances`) on
+		each instance in each bag but returns the predicted class probabilities
+		per bag in an array.
+
+        Parameters
+        ----------
+        X : array, shape = [n_bags], items = ( array-like, shape = [n_samples, n_features] )
+            Bag-level test set.
+
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
+
+        Returns
+        -------
+        y_pred : array, shape = [n_bags], items = ( array-like, shape = [n_samples, 2] )
+		'''
+		assert(not self.svc == None)
+		bag_level_samples = X
+		bag_level_probas = []
+		for bag_level_sample in bag_level_samples:
+			bags_instance_level_samples = bag_level_sample
+			if K == None:
+				bags_instance_level_probas = self.svc.predict_proba(bags_instance_level_samples)
+			else:
+				subset_kernel = K[bags_instance_level_samples, :][:, self.precomputed_kernel_training_indices_]
+				bags_instance_level_probas = self.svc.predict_proba(subset_kernel)
+			bag_level_probas.append(bags_instance_level_probas)
+		return bag_level_probas
+
+	def predict_proba_instances(self, X, K=None):
+		'''
+		Just a pass-through to the trained SVC's `predict_proba` method unless a K is
+		specified.
+		
+		Parameters
+		----------
+        X : array-like, shape = [n_samples, n_features]
+            Instance-level test set.
+
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
+		
+		Returns
+		-------
+		y_pred : array, shape = [n_samples]
+		'''
+		assert(not self.svc == None)
+		if K == None:
+			return self.svc.predict_proba(X)
+		else:
+			subset_kernel = K[X, :][:, self.precomputed_kernel_training_indices_]
+			return self.svc.predict_proba(subset_kernel)
+
+	def score_in_bag(self, X, y, K=None):
 		'''
 		Returns the instance-level accuracy per bag on the given test bag-level data
 		and per-bag-instance-level labels.
@@ -222,6 +375,13 @@ class MultipleInstanceSVC():
         [n_samples] )
             Bag-level labels for X.
 
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
+
         Returns
         -------
         z : array, shape = [n_bags]
@@ -233,11 +393,12 @@ class MultipleInstanceSVC():
 		for bag_level_sample, bag_level_target in zip(bag_level_samples, bag_level_targets):
 			bags_instance_level_samples = bag_level_sample
 			bags_instance_level_targets = bag_level_target
-			bags_instance_level_scores = self.svc.score(bags_instance_level_samples, bags_instance_level_targets)
+			bags_instance_level_labels = self.predict_instances(bags_instance_level_samples, K=K)
+			bags_instance_level_scores = sklearn.metrics.accuracy_score(bags_instance_level_labels, bags_instance_level_targets)
 			bag_level_scores.append(bags_instance_level_scores)
 		return bag_level_scores
 
-	def score(self, X, y):
+	def score(self, X, y, K=None):
 		'''
 		Returns the mean bag-level accuracy on the given test bag-level data and
 		bag-level labels.
@@ -250,18 +411,27 @@ class MultipleInstanceSVC():
         y : array-like, shape = [n_bags]
             Bag-level labels for X.
 
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
+
         Returns
         -------
         z : float
 		'''
-		return sklearn.metrics.accuracy_score(self.predict(X), y)
+		assert(not self.svc == None)
+		return sklearn.metrics.accuracy_score(self.predict(X, K=K), y)
 
-	def score_instances(self, X, y):
+	def score_instances(self, X, y, K=None):
 		'''
 		Returns the instance-level accuracy on the given test intance-level data
 		and instance-level labels.
 
-		Just a pass-through to the trained SVC's `score` method.
+		Just a pass-through to the trained SVC's `score` method unless a K is
+		specified.
 
         Parameters
         ----------
@@ -271,9 +441,17 @@ class MultipleInstanceSVC():
         y : array-like, shape = [n_samples]
             Instance-level labels for X.
 
+        K : array-like, sparse matrix, shape = [total_n_samples, total_n_samples], options, (default=None)
+            Distance kernel (Gram matrix) for precomputed kernels. If a precomputed
+            kernel is used then the bag instances should be indices to the
+            instances appropriate row in the distance kernel. This means each bag
+            will simply be an array-like of integers meaning the effective
+            n_features will be 1.
+
         Returns
         -------
         z : float
 		'''
-		return self.svc.score(X)
+		assert(not self.svc == None)
+		return sklearn.metrics.accuracy_score(self.predict_instances(X, K=K), y)
 
